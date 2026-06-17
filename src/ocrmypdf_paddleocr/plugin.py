@@ -46,6 +46,41 @@ def add_options(parser):
         help='Use GPU acceleration for PaddleOCR (requires GPU-enabled PaddlePaddle)',
     )
     paddle.add_argument(
+        '--paddle-min-confidence',
+        type=float,
+        default=0.0,
+        metavar='FLOAT',
+        dest='paddle_min_confidence',
+        help=(
+            'Minimum recognition confidence (0.0-1.0) returned by PaddleOCR required '
+            'to keep a word or line. Items scoring below this threshold are dropped. '
+            'Default: 0.0 (no filtering)'
+        ),
+    )
+    paddle.add_argument(
+        '--paddle-min-alnum-ratio',
+        type=float,
+        default=0.0,
+        metavar='FLOAT',
+        dest='paddle_min_alnum_ratio',
+        help=(
+            'Drop "garbage" lines whose ratio of alphanumeric to non-space characters '
+            'is below this value (0.0-1.0), filtering out lines composed mostly of '
+            'symbols. Default: 0.0 (no filtering)'
+        ),
+    )
+    paddle.add_argument(
+        '--paddle-min-alnum-chars',
+        type=int,
+        default=0,
+        metavar='N',
+        dest='paddle_min_alnum_chars',
+        help=(
+            'Drop lines containing fewer than N alphanumeric characters, filtering out '
+            'short nonsensical detections. Default: 0 (no filtering)'
+        ),
+    )
+    paddle.add_argument(
         '--paddle-no-angle-cls',
         action='store_false',
         dest='paddle_use_angle_cls',
@@ -77,6 +112,24 @@ def add_options(parser):
 @hookimpl
 def check_options(options):
     """Validate PaddleOCR options."""
+    from ocrmypdf.exceptions import BadArgsError
+
+    min_conf = getattr(options, 'paddle_min_confidence', 0.0)
+    if not 0.0 <= min_conf <= 1.0:
+        raise BadArgsError(
+            f"--paddle-min-confidence must be between 0.0 and 1.0 (got {min_conf})"
+        )
+    min_ratio = getattr(options, 'paddle_min_alnum_ratio', 0.0)
+    if not 0.0 <= min_ratio <= 1.0:
+        raise BadArgsError(
+            f"--paddle-min-alnum-ratio must be between 0.0 and 1.0 (got {min_ratio})"
+        )
+    min_chars = getattr(options, 'paddle_min_alnum_chars', 0)
+    if min_chars < 0:
+        raise BadArgsError(
+            f"--paddle-min-alnum-chars must be >= 0 (got {min_chars})"
+        )
+
     engine = getattr(options, 'paddle_engine', 'classic')
     if engine == 'vl':
         if PaddleOCRVL is None:
@@ -111,6 +164,43 @@ def _poly_to_bbox(poly):
         y_min = int(min(ys))
         y_max = int(max(ys))
     return x_min, y_min, x_max, y_max
+
+
+def _is_garbage_line(text, min_alnum_ratio, min_alnum_chars):
+    """Decide whether a recognized line is nonsensical and should be dropped.
+
+    A line is considered garbage when it contains too few alphanumeric characters
+    (``min_alnum_chars``) or when the share of alphanumeric characters among its
+    non-space characters falls below ``min_alnum_ratio`` (i.e. it is composed
+    mostly of symbols). ``str.isalnum`` is Unicode-aware, so accented letters and
+    non-Latin scripts count as alphanumeric.
+
+    Filtering is disabled for any threshold left at its default (0).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+
+    alnum = sum(1 for c in stripped if c.isalnum())
+
+    if min_alnum_chars > 0 and alnum < min_alnum_chars:
+        return True
+
+    if min_alnum_ratio > 0:
+        non_space = sum(1 for c in stripped if not c.isspace())
+        if non_space == 0 or (alnum / non_space) < min_alnum_ratio:
+            return True
+
+    return False
+
+
+def _get_filter_thresholds(options):
+    """Return (min_confidence, min_alnum_ratio, min_alnum_chars) from options."""
+    return (
+        getattr(options, 'paddle_min_confidence', 0.0) or 0.0,
+        getattr(options, 'paddle_min_alnum_ratio', 0.0) or 0.0,
+        getattr(options, 'paddle_min_alnum_chars', 0) or 0,
+    )
 
 
 def _group_words_into_lines(word_boxes):
@@ -389,22 +479,34 @@ class PaddleOCREngine(OcrEngine):
             page_res = result[0]
             spotting = page_res.get('spotting_res') if hasattr(page_res, 'get') else None
 
+            min_conf, min_ratio, min_chars = _get_filter_thresholds(options)
+
             if spotting and spotting.get('rec_polys') and spotting.get('rec_texts'):
                 # ── Spotting path: native word-level polygon boxes ──────────────
                 rec_polys = spotting['rec_polys']
                 rec_texts = spotting['rec_texts']
+                rec_scores = spotting.get('rec_scores') or []
 
-                word_boxes = [
-                    (txt, poly)
-                    for txt, poly in zip(rec_texts, rec_polys)
-                    if txt and txt.strip()
-                ]
+                word_boxes = []
+                for idx, (txt, poly) in enumerate(zip(rec_texts, rec_polys)):
+                    if not (txt and txt.strip()):
+                        continue
+                    if idx < len(rec_scores) and rec_scores[idx] < min_conf:
+                        log.debug(f"Dropping VL word {txt!r} "
+                                  f"(confidence {rec_scores[idx]:.3f} < {min_conf})")
+                        continue
+                    word_boxes.append((txt, poly))
 
                 lines = _group_words_into_lines(word_boxes)
                 log.debug(f"PaddleOCR-VL spotting: {len(word_boxes)} words, {len(lines)} lines")
 
                 for line_words in lines:
                     if not line_words:
+                        continue
+
+                    line_text = ' '.join(t for t, _ in line_words)
+                    if _is_garbage_line(line_text, min_ratio, min_chars):
+                        log.debug(f"Dropping garbage VL line: {line_text!r}")
                         continue
 
                     all_x0, all_y0, all_x1, all_y1 = [], [], [], []
@@ -414,7 +516,7 @@ class PaddleOCREngine(OcrEngine):
                         all_x1.append(wx1); all_y1.append(wy1)
 
                     lx0, ly0, lx1, ly1 = min(all_x0), min(all_y0), max(all_x1), max(all_y1)
-                    all_text.append(' '.join(t for t, _ in line_words))
+                    all_text.append(line_text)
 
                     hocr_lines.append(
                         f'<div class="ocr_carea" id="carea_{carea_id}" '
@@ -495,6 +597,10 @@ class PaddleOCREngine(OcrEngine):
                     for li, line_text in enumerate(block_lines):
                         words = line_text.split()
                         if not words:
+                            continue
+
+                        if _is_garbage_line(line_text, min_ratio, min_chars):
+                            log.debug(f"Dropping garbage VL block line: {line_text!r}")
                             continue
 
                         ly0_est = by0 + li * line_h
@@ -630,12 +736,23 @@ class PaddleOCREngine(OcrEngine):
             has_word_boxes = bool(text_words and text_word_regions)
             log.debug(f"PaddleOCR found {len(texts)} text regions, word boxes: {has_word_boxes}")
 
+            min_conf, min_ratio, min_chars = _get_filter_thresholds(options)
+
             word_id = 1
             carea_id = 1
             par_id = 1
 
             for line_id, (text, score, poly) in enumerate(zip(texts, scores, polys), 1):
                 if not text:
+                    continue
+
+                if score < min_conf:
+                    log.debug(f"Dropping line {line_id!r} (confidence {score:.3f} "
+                              f"< {min_conf})")
+                    continue
+
+                if _is_garbage_line(text, min_ratio, min_chars):
+                    log.debug(f"Dropping garbage line {line_id}: {text!r}")
                     continue
 
                 all_text.append(text)
