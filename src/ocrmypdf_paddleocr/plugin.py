@@ -343,6 +343,11 @@ class PaddleOCREngine(OcrEngine):
             'use_doc_unwarping': False,
             # Disable orientation classification - OCRmyPDF handles page rotation
             'use_doc_orientation_classify': False,
+            # Disable Intel oneDNN
+            # https://github.com/PaddlePaddle/Paddle/issues/77340
+            'enable_mkldnn': False,
+            'text_detection_model_name': 'PP-OCRv6_tiny_det',
+            'text_recognition_model_name': 'PP-OCRv6_tiny_rec',
         }
 
         # Set device for GPU/CPU
